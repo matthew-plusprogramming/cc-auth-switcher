@@ -52,6 +52,11 @@ claude2                  # log in with account 2
 
 From now on, use `claude1` or `claude2` instead of `claude`. When one account hits rate limits, switch to the other. Revolutionary technology.
 
+> **Note:** Running plain `claude` still uses your original `~/.claude/` config — it's completely separate from `claude1` and `claude2`. If you want `claude` to default to one of your accounts, add this to your shell rc:
+> ```bash
+> alias claude='claude1'
+> ```
+
 ## Commands
 
 | Command | What it does |
