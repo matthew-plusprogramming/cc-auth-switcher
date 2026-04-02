@@ -1,6 +1,6 @@
 # cc-auth-switcher
 
-Switch between two Claude Code accounts in one command. That's it. That's the whole tool.
+Switch between two Claude Code accounts in one command. So simple Claude can do it for you.
 
 No dependencies. No config files. No dashboard. Just shell aliases and symlinks.
 
