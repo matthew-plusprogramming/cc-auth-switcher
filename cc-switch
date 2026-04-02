@@ -22,20 +22,39 @@ cc-switch - Claude Code auth switcher
 Usage: cc-switch <command>
 
 Commands:
-  setup           Create account profiles and install shell aliases
-  sync            Re-sync symlinks (run after Claude adds new config files)
+  add <name>      Create a new account profile and shell alias
+  remove <name>   Remove an account profile and its alias
   list            Show configured accounts
-  uninstall       Remove profiles and aliases
+  sync            Re-sync symlinks (run after Claude adds new config files)
+  uninstall       Remove all profiles and aliases
 
-After setup, launch Claude Code with a specific account:
-  claude1         Use account 1
-  claude2         Use account 2
+Examples:
+  cc-switch add work        # creates 'work' alias and ~/.claude-work
+  cc-switch add personal    # creates 'personal' alias and ~/.claude-personal
+  cc-switch remove personal # removes it
+
+After adding, source your shell rc and use the alias name to launch:
+  work                      # Claude Code with work account
+  personal                  # Claude Code with personal account
 EOF
 }
 
 check_claude() {
   if [[ ! -d "$CLAUDE_HOME" ]]; then
     echo -e "${RED}Error:${RESET} ~/.claude not found. Run Claude Code at least once first."
+    exit 1
+  fi
+}
+
+validate_name() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo -e "${RED}Error:${RESET} Profile name required."
+    echo "Usage: cc-switch add <name>"
+    exit 1
+  fi
+  if [[ "$name" =~ [^a-zA-Z0-9_-] ]]; then
+    echo -e "${RED}Error:${RESET} Profile name can only contain letters, numbers, hyphens, and underscores."
     exit 1
   fi
 }
@@ -50,11 +69,9 @@ link_profile() {
     [[ ! -e "$item" ]] && continue
     local name
     name=$(basename "$item")
-    # Skip if already linked correctly
     if [[ -L "$profile_dir/$name" && "$(readlink "$profile_dir/$name")" == "$item" ]]; then
       continue
     fi
-    # Remove stale entry if exists
     [[ -e "$profile_dir/$name" || -L "$profile_dir/$name" ]] && rm -rf "$profile_dir/$name"
     ln -s "$item" "$profile_dir/$name"
   done
@@ -79,83 +96,111 @@ link_profile() {
   fi
 }
 
-cmd_setup() {
+# Get all profile names from shell rc
+get_profiles() {
+  grep "# cc-switch:" "$SHELL_RC" 2>/dev/null | sed 's/.*# cc-switch: //' || true
+}
+
+cmd_add() {
+  local name="${1:-}"
+  validate_name "$name"
   check_claude
 
-  echo -e "${BOLD}Setting up two Claude Code profiles...${RESET}"
+  local profile_dir="$HOME/.claude-$name"
+
+  # Check if already exists
+  if grep -q "# cc-switch: $name" "$SHELL_RC" 2>/dev/null; then
+    echo -e "${DIM}Profile '$name' already exists.${RESET}"
+    return
+  fi
+
+  link_profile "$profile_dir"
+
+  # Add alias to shell rc
+  echo "alias $name='CLAUDE_CONFIG_DIR=~/.claude-$name claude' # cc-switch: $name" >> "$SHELL_RC"
+
+  echo -e "${GREEN}+${RESET} Created profile ${BOLD}$name${RESET}"
+  echo -e "  ${DIM}Config: ~/.claude-$name${RESET}"
   echo ""
+  echo -e "Run: ${BOLD}source $SHELL_RC${RESET} then ${BOLD}$name${RESET} to log in"
+}
 
-  link_profile "$HOME/.claude-account1"
-  link_profile "$HOME/.claude-account2"
+cmd_remove() {
+  local name="${1:-}"
+  validate_name "$name"
 
-  echo -e "  ${GREEN}+${RESET} ~/.claude-account1"
-  echo -e "  ${GREEN}+${RESET} ~/.claude-account2"
-  echo ""
+  local profile_dir="$HOME/.claude-$name"
 
-  # Install aliases if not present
-  local alias_block
-  alias_block=$(cat <<'ALIASES'
+  if [[ -d "$profile_dir" ]]; then
+    rm -rf "$profile_dir"
+    echo -e "${RED}-${RESET} Removed ~/.claude-$name"
+  fi
 
-# cc-auth-switcher: Claude Code account aliases
-alias claude1='CLAUDE_CONFIG_DIR=~/.claude-account1 claude'
-alias claude2='CLAUDE_CONFIG_DIR=~/.claude-account2 claude'
-ALIASES
-)
-
-  if ! grep -q "cc-auth-switcher" "$SHELL_RC" 2>/dev/null; then
-    echo "$alias_block" >> "$SHELL_RC"
-    echo -e "  ${GREEN}+${RESET} Added aliases to $(basename "$SHELL_RC")"
-  else
-    echo -e "  ${DIM}Aliases already in $(basename "$SHELL_RC")${RESET}"
+  if [[ -f "$SHELL_RC" ]]; then
+    sed -i '' "/# cc-switch: $name$/d" "$SHELL_RC"
+    echo -e "${RED}-${RESET} Removed alias from $(basename "$SHELL_RC")"
   fi
 
   echo ""
-  echo -e "${BOLD}Next steps:${RESET}"
-  echo "  1. source $SHELL_RC"
-  echo "  2. Run 'claude1' and log in with your first account"
-  echo "  3. Run 'claude2' and log in with your second account"
+  echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
+}
+
+cmd_list() {
+  local profiles
+  profiles=$(get_profiles)
+
+  if [[ -z "$profiles" ]]; then
+    echo -e "${DIM}No profiles configured. Run: cc-switch add <name>${RESET}"
+    return
+  fi
+
+  echo -e "${BOLD}Configured accounts:${RESET}"
   echo ""
-  echo -e "${DIM}All config is shared. Only auth is separate.${RESET}"
+  while IFS= read -r name; do
+    local creds="$HOME/.claude-$name/.credentials.json"
+    if [[ -f "$creds" ]]; then
+      echo -e "  ${BOLD}$name${RESET}  ${GREEN}logged in${RESET}"
+    else
+      echo -e "  ${BOLD}$name${RESET}  ${DIM}not yet logged in${RESET}"
+    fi
+  done <<< "$profiles"
+  echo ""
 }
 
 cmd_sync() {
   check_claude
-  link_profile "$HOME/.claude-account1"
-  link_profile "$HOME/.claude-account2"
-  echo -e "${GREEN}Symlinks synced.${RESET}"
-}
+  local profiles
+  profiles=$(get_profiles)
 
-cmd_list() {
-  echo -e "${BOLD}Configured accounts:${RESET}"
-  echo ""
-  for i in 1 2; do
-    local dir="$HOME/.claude-account$i"
-    local creds="$dir/.credentials.json"
-    if [[ -f "$creds" ]]; then
-      echo -e "  claude${i}  ${GREEN}logged in${RESET}"
-    elif [[ -d "$dir" ]]; then
-      echo -e "  claude${i}  ${DIM}not yet logged in${RESET}"
-    else
-      echo -e "  claude${i}  ${DIM}not set up${RESET}"
-    fi
-  done
-  echo ""
+  if [[ -z "$profiles" ]]; then
+    echo -e "${DIM}No profiles to sync.${RESET}"
+    return
+  fi
+
+  while IFS= read -r name; do
+    link_profile "$HOME/.claude-$name"
+  done <<< "$profiles"
+  echo -e "${GREEN}Symlinks synced.${RESET}"
 }
 
 cmd_uninstall() {
   echo -e "${BOLD}Removing cc-auth-switcher...${RESET}"
 
-  for i in 1 2; do
-    local dir="$HOME/.claude-account$i"
-    if [[ -d "$dir" ]]; then
-      rm -rf "$dir"
-      echo -e "  ${RED}-${RESET} $dir"
-    fi
-  done
+  local profiles
+  profiles=$(get_profiles)
+
+  if [[ -n "$profiles" ]]; then
+    while IFS= read -r name; do
+      local dir="$HOME/.claude-$name"
+      if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+        echo -e "  ${RED}-${RESET} $dir"
+      fi
+    done <<< "$profiles"
+  fi
 
   if [[ -f "$SHELL_RC" ]]; then
-    # Remove the alias block
-    sed -i '' '/# cc-auth-switcher/,/^alias claude2=/d' "$SHELL_RC"
+    sed -i '' '/# cc-switch: /d' "$SHELL_RC"
     echo -e "  ${RED}-${RESET} Removed aliases from $(basename "$SHELL_RC")"
   fi
 
@@ -164,9 +209,10 @@ cmd_uninstall() {
 }
 
 case "${1:-}" in
-  setup)     cmd_setup ;;
-  sync)      cmd_sync ;;
+  add)       cmd_add "${2:-}" ;;
+  remove)    cmd_remove "${2:-}" ;;
   list)      cmd_list ;;
+  sync)      cmd_sync ;;
   uninstall) cmd_uninstall ;;
   -h|--help) usage ;;
   *)         usage ;;
