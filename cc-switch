@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# cc-switch - Dead simple Claude Code auth switcher
+# Shares all config between accounts. Only credentials are separate.
+# https://github.com/matthewlin/cc-auth-switcher
+
+set -euo pipefail
+
+CLAUDE_HOME="${HOME}/.claude"
+SHELL_RC="${HOME}/.zshrc"
+[[ -f "${HOME}/.bashrc" && ! -f "${HOME}/.zshrc" ]] && SHELL_RC="${HOME}/.bashrc"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+usage() {
+  cat <<EOF
+cc-switch - Claude Code auth switcher
+
+Usage: cc-switch <command>
+
+Commands:
+  setup           Create account profiles and install shell aliases
+  sync            Re-sync symlinks (run after Claude adds new config files)
+  list            Show configured accounts
+  uninstall       Remove profiles and aliases
+
+After setup, launch Claude Code with a specific account:
+  claude1         Use account 1
+  claude2         Use account 2
+EOF
+}
+
+check_claude() {
+  if [[ ! -d "$CLAUDE_HOME" ]]; then
+    echo -e "${RED}Error:${RESET} ~/.claude not found. Run Claude Code at least once first."
+    exit 1
+  fi
+}
+
+# Symlink everything from ~/.claude into a profile dir, except credentials
+link_profile() {
+  local profile_dir="$1"
+  mkdir -p "$profile_dir"
+
+  # Symlink visible files/dirs
+  for item in "$CLAUDE_HOME"/*; do
+    [[ ! -e "$item" ]] && continue
+    local name
+    name=$(basename "$item")
+    # Skip if already linked correctly
+    if [[ -L "$profile_dir/$name" && "$(readlink "$profile_dir/$name")" == "$item" ]]; then
+      continue
+    fi
+    # Remove stale entry if exists
+    [[ -e "$profile_dir/$name" || -L "$profile_dir/$name" ]] && rm -rf "$profile_dir/$name"
+    ln -s "$item" "$profile_dir/$name"
+  done
+
+  # Symlink hidden files/dirs (except .credentials.json)
+  for item in "$CLAUDE_HOME"/.*; do
+    [[ ! -e "$item" ]] && continue
+    local name
+    name=$(basename "$item")
+    [[ "$name" == "." || "$name" == ".." ]] && continue
+    [[ "$name" == ".credentials.json" ]] && continue
+    if [[ -L "$profile_dir/$name" && "$(readlink "$profile_dir/$name")" == "$item" ]]; then
+      continue
+    fi
+    [[ -e "$profile_dir/$name" || -L "$profile_dir/$name" ]] && rm -rf "$profile_dir/$name"
+    ln -s "$item" "$profile_dir/$name"
+  done
+
+  # Remove credentials symlink if it exists (each profile owns its own)
+  [[ -L "$profile_dir/.credentials.json" ]] && rm "$profile_dir/.credentials.json"
+}
+
+cmd_setup() {
+  check_claude
+
+  echo -e "${BOLD}Setting up two Claude Code profiles...${RESET}"
+  echo ""
+
+  link_profile "$HOME/.claude-account1"
+  link_profile "$HOME/.claude-account2"
+
+  echo -e "  ${GREEN}+${RESET} ~/.claude-account1"
+  echo -e "  ${GREEN}+${RESET} ~/.claude-account2"
+  echo ""
+
+  # Install aliases if not present
+  local alias_block
+  alias_block=$(cat <<'ALIASES'
+
+# cc-auth-switcher: Claude Code account aliases
+alias claude1='CLAUDE_CONFIG_DIR=~/.claude-account1 claude'
+alias claude2='CLAUDE_CONFIG_DIR=~/.claude-account2 claude'
+ALIASES
+)
+
+  if ! grep -q "cc-auth-switcher" "$SHELL_RC" 2>/dev/null; then
+    echo "$alias_block" >> "$SHELL_RC"
+    echo -e "  ${GREEN}+${RESET} Added aliases to $(basename "$SHELL_RC")"
+  else
+    echo -e "  ${DIM}Aliases already in $(basename "$SHELL_RC")${RESET}"
+  fi
+
+  echo ""
+  echo -e "${BOLD}Next steps:${RESET}"
+  echo "  1. source $SHELL_RC"
+  echo "  2. Run 'claude1' and log in with your first account"
+  echo "  3. Run 'claude2' and log in with your second account"
+  echo ""
+  echo -e "${DIM}All config is shared. Only auth is separate.${RESET}"
+}
+
+cmd_sync() {
+  check_claude
+  link_profile "$HOME/.claude-account1"
+  link_profile "$HOME/.claude-account2"
+  echo -e "${GREEN}Symlinks synced.${RESET}"
+}
+
+cmd_list() {
+  echo -e "${BOLD}Configured accounts:${RESET}"
+  echo ""
+  for i in 1 2; do
+    local dir="$HOME/.claude-account$i"
+    local creds="$dir/.credentials.json"
+    if [[ -f "$creds" ]]; then
+      echo -e "  claude${i}  ${GREEN}logged in${RESET}"
+    elif [[ -d "$dir" ]]; then
+      echo -e "  claude${i}  ${DIM}not yet logged in${RESET}"
+    else
+      echo -e "  claude${i}  ${DIM}not set up${RESET}"
+    fi
+  done
+  echo ""
+}
+
+cmd_uninstall() {
+  echo -e "${BOLD}Removing cc-auth-switcher...${RESET}"
+
+  for i in 1 2; do
+    local dir="$HOME/.claude-account$i"
+    if [[ -d "$dir" ]]; then
+      rm -rf "$dir"
+      echo -e "  ${RED}-${RESET} $dir"
+    fi
+  done
+
+  if [[ -f "$SHELL_RC" ]]; then
+    # Remove the alias block
+    sed -i '' '/# cc-auth-switcher/,/^alias claude2=/d' "$SHELL_RC"
+    echo -e "  ${RED}-${RESET} Removed aliases from $(basename "$SHELL_RC")"
+  fi
+
+  echo ""
+  echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
+}
+
+case "${1:-}" in
+  setup)     cmd_setup ;;
+  sync)      cmd_sync ;;
+  list)      cmd_list ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help) usage ;;
+  *)         usage ;;
+esac
