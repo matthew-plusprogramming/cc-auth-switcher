@@ -74,7 +74,9 @@ link_profile() {
   done
 
   # Remove credentials symlink if it exists (each profile owns its own)
-  [[ -L "$profile_dir/.credentials.json" ]] && rm "$profile_dir/.credentials.json"
+  if [[ -L "$profile_dir/.credentials.json" ]]; then
+    rm "$profile_dir/.credentials.json"
+  fi
 }
 
 cmd_setup() {
