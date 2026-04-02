@@ -24,6 +24,7 @@ Usage: cc-switch <command>
 Commands:
   add <name>      Create a new account profile and shell alias
   remove <name>   Remove an account profile and its alias
+  swap <name>     Swap ~/.claude auth to a profile (use plain 'claude')
   list            Show configured accounts
   sync            Re-sync symlinks (run after Claude adds new config files)
   uninstall       Remove all profiles and aliases
@@ -33,9 +34,12 @@ Examples:
   cc-switch add personal    # creates 'personal' alias and ~/.claude-personal
   cc-switch remove personal # removes it
 
-After adding, source your shell rc and use the alias name to launch:
+Use named aliases (each profile has its own config dir):
   work                      # Claude Code with work account
   personal                  # Claude Code with personal account
+
+Or swap in-place (simplest — just swaps auth in ~/.claude):
+  cc-switch swap work       # now plain 'claude' uses work credentials
 EOF
 }
 
@@ -145,6 +149,22 @@ cmd_remove() {
   echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
 }
 
+cmd_swap() {
+  local name="${1:-}"
+  validate_name "$name"
+  check_claude
+
+  local profile_creds="$HOME/.claude-$name/.credentials.json"
+
+  if [[ ! -f "$profile_creds" ]]; then
+    echo -e "${RED}Error:${RESET} Profile '$name' has no credentials. Log in first by running: $name"
+    exit 1
+  fi
+
+  cp "$profile_creds" "$CLAUDE_HOME/.credentials.json"
+  echo -e "${GREEN}Swapped.${RESET} ${BOLD}claude${RESET} now uses ${BOLD}$name${RESET} credentials."
+}
+
 cmd_list() {
   local profiles
   profiles=$(get_profiles)
@@ -211,6 +231,7 @@ cmd_uninstall() {
 case "${1:-}" in
   add)       cmd_add "${2:-}" ;;
   remove)    cmd_remove "${2:-}" ;;
+  swap)      cmd_swap "${2:-}" ;;
   list)      cmd_list ;;
   sync)      cmd_sync ;;
   uninstall) cmd_uninstall ;;

@@ -49,19 +49,28 @@ work                        # log in with account 1
 personal                    # log in with account 2
 ```
 
-### Switch
+### Switch — two options
 
-When one account hits rate limits, use the other. The alias name launches Claude Code with that account's credentials:
+**Option A: Named aliases** (each gets its own isolated config dir)
 
 ```bash
-work                        # use work account
-personal                    # use personal account
+work                        # launches claude with work credentials
+personal                    # launches claude with personal credentials
 ```
 
-> **Note:** Running plain `claude` still uses your original `~/.claude/` config — it's separate from your named profiles. To make a profile the default:
-> ```bash
-> alias claude='work'
-> ```
+Each alias uses `CLAUDE_CONFIG_DIR` to point at a separate profile directory. You can run them side by side in different terminals without conflict.
+
+**Option B: In-place swap** (simplest — just use plain `claude`)
+
+```bash
+cc-switch swap work         # swaps ~/.claude credentials to work account
+claude                      # now uses work credentials
+
+cc-switch swap personal     # swap again
+claude                      # now uses personal credentials
+```
+
+This copies the profile's `.credentials.json` directly into `~/.claude/`. No aliases needed, no env vars — plain `claude` just works with whichever account you last swapped to. One command to switch.
 
 ### Manage
 
@@ -76,6 +85,9 @@ cc-switch uninstall         # remove everything
 
 **Q: Will my settings be different between accounts?**
 No. Everything is symlinked. All accounts share the same settings, memory, hooks, and project config. Only the auth token is separate.
+
+**Q: Aliases or swap — which should I use?**
+Use **aliases** if you want to run multiple accounts simultaneously in different terminals. Use **swap** if you just want the simplest possible flow with plain `claude`.
 
 **Q: Do I need to re-run anything after updating Claude Code?**
 Only if Claude adds new top-level files to `~/.claude/`. Run `cc-switch sync` to pick them up.
