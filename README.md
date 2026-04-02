@@ -23,7 +23,7 @@ Settings, memory, hooks, projects — all shared. Just the login is different.
 ## Install
 
 ```bash
-git clone https://github.com/matthewlin/cc-auth-switcher.git
+git clone https://github.com/matthew-plusprogramming/cc-auth-switcher.git
 cd cc-auth-switcher
 chmod +x cc-switch
 sudo cp cc-switch /usr/local/bin/

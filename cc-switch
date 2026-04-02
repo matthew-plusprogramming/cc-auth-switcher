@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cc-switch - Dead simple Claude Code auth switcher
 # Shares all config between accounts. Only credentials are separate.
-# https://github.com/matthewlin/cc-auth-switcher
+# https://github.com/matthew-plusprogramming/cc-auth-switcher
 
 set -euo pipefail
 
