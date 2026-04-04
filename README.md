@@ -81,6 +81,35 @@ cc-switch remove client-x   # remove a profile
 cc-switch uninstall         # remove everything
 ```
 
+## Token refresh
+
+Inactive profiles (ones not currently running a Claude Code session) will eventually have their OAuth tokens expire. The included `refresh-tokens.mjs` script keeps them fresh by auto-discovering all `~/.claude-*` profiles and refreshing any tokens that are close to expiry. It skips `~/.claude` since the active session refreshes itself.
+
+**Setup with cron (recommended — every 4 hours):**
+
+```bash
+# Find your node path
+which node
+
+# Add the cron job (replace /path/to with actual paths)
+crontab -e
+0 */4 * * * /path/to/node /path/to/cc-auth-switcher/refresh-tokens.mjs >> ~/.claude/logs/token-refresh.log 2>&1
+```
+
+**Manual run:**
+
+```bash
+node refresh-tokens.mjs
+```
+
+**Check logs:**
+
+```bash
+cat ~/.claude/logs/token-refresh.log
+```
+
+Requires Node 18+ (uses built-in `fetch`).
+
 ## FAQ
 
 **Q: Will my settings be different between accounts?**
