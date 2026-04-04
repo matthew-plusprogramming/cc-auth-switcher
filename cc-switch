@@ -27,6 +27,9 @@ Commands:
   swap <name>     Swap ~/.claude auth to a profile (use plain 'claude')
   list            Show configured accounts
   sync            Re-sync symlinks (run after Claude adds new config files)
+  warm            Refresh tokens for inactive profiles
+  warm-setup      Install launchd job to warm every 30 minutes
+  warm-uninstall  Remove the warming launchd job
   uninstall       Remove all profiles and aliases
 
 Examples:
@@ -269,13 +272,178 @@ cmd_uninstall() {
   echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
 }
 
+# --- Token warming ---
+
+WARM_LOG_FILE="${HOME}/.cc-switch/warm.log"
+WARM_PLIST_NAME="com.cc-switch.warm"
+WARM_PLIST_DST="${HOME}/Library/LaunchAgents/${WARM_PLIST_NAME}.plist"
+
+_warm_log() {
+  local ts
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  mkdir -p "$(dirname "$WARM_LOG_FILE")"
+  echo "${ts} $1" >> "$WARM_LOG_FILE"
+}
+
+_find_claude() {
+  local candidate
+  for candidate in \
+      "${HOME}/.local/bin/claude" \
+      "/usr/local/bin/claude" \
+      "/opt/homebrew/bin/claude"; do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Check if a profile's token expires within the next 60 minutes
+_token_needs_warm() {
+  local creds_file="$1"
+  local expires_at
+  # Extract expiresAt from JSON without jq — works because it's always a number
+  expires_at=$(grep -o '"expiresAt":[0-9]*' "$creds_file" 2>/dev/null | grep -o '[0-9]*')
+  if [[ -z "$expires_at" ]]; then
+    return 0  # can't tell, warm it
+  fi
+  local now_ms=$(( $(date +%s) * 1000 ))
+  local threshold_ms=$(( 60 * 60 * 1000 ))  # 60 minutes
+  (( expires_at - now_ms < threshold_ms ))
+}
+
+cmd_warm() {
+  local profiles
+  profiles=$(get_profiles)
+
+  if [[ -z "$profiles" ]]; then
+    echo -e "${DIM}No profiles to warm.${RESET}"
+    return
+  fi
+
+  local swap_marker="$CLAUDE_HOME/.cc-swap-active"
+  local active=""
+  if [[ -f "$swap_marker" ]]; then
+    active=$(cat "$swap_marker" | tr -d '[:space:]')
+  fi
+
+  # Sync .claude credentials back to active profile
+  if [[ -n "$active" && -f "$CLAUDE_HOME/.credentials.json" ]]; then
+    local active_dir="$HOME/.claude-$active"
+    if [[ -d "$active_dir" ]]; then
+      cp "$CLAUDE_HOME/.credentials.json" "$active_dir/.credentials.json"
+      _warm_log "[${active}] Synced credentials from .claude"
+    fi
+  fi
+
+  local claude_bin
+  claude_bin=$(_find_claude) || {
+    echo -e "${RED}Error:${RESET} claude binary not found"
+    _warm_log "ERROR: claude binary not found"
+    return 1
+  }
+
+  local warmed=0 skipped=0 failed=0
+
+  while IFS= read -r name; do
+    local profile_dir="$HOME/.claude-$name"
+    local creds="$profile_dir/.credentials.json"
+
+    if [[ ! -f "$creds" ]]; then
+      _warm_log "[${name}] No credentials — skipping"
+      ((skipped++))
+      continue
+    fi
+
+    if ! _token_needs_warm "$creds"; then
+      _warm_log "[${name}] Token still fresh — skipping"
+      ((skipped++))
+      continue
+    fi
+
+    _warm_log "[${name}] Warming token..."
+    if timeout 120 env CLAUDE_CONFIG_DIR="$profile_dir" "$claude_bin" -p "hi" --max-turns 1 >/dev/null 2>&1; then
+      _warm_log "[${name}] Token warmed"
+      echo -e "  ${BOLD}$name${RESET}  ${GREEN}warmed${RESET}"
+      ((warmed++))
+    else
+      _warm_log "[${name}] Warm failed"
+      echo -e "  ${BOLD}$name${RESET}  ${RED}failed${RESET}"
+      ((failed++))
+    fi
+  done <<< "$profiles"
+
+  echo ""
+  echo -e "${DIM}${warmed} warmed, ${skipped} skipped, ${failed} failed${RESET}"
+  echo -e "${DIM}Log: ${WARM_LOG_FILE}${RESET}"
+}
+
+cmd_warm_setup() {
+  local script_path
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  cat > "$WARM_PLIST_DST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${WARM_PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${script_path}</string>
+        <string>warm</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>StandardOutPath</key>
+    <string>${HOME}/.cc-switch/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/.cc-switch/launchd-stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+  mkdir -p "${HOME}/.cc-switch"
+  launchctl unload "$WARM_PLIST_DST" 2>/dev/null || true
+  launchctl load "$WARM_PLIST_DST"
+
+  echo -e "${GREEN}Token warming installed.${RESET} Runs every 30 minutes."
+  echo -e "  Plist: ${WARM_PLIST_DST}"
+  echo -e "  Log:   ${WARM_LOG_FILE}"
+  echo ""
+  echo -e "To stop: ${BOLD}cc-switch warm-uninstall${RESET}"
+}
+
+cmd_warm_uninstall() {
+  if [[ -f "$WARM_PLIST_DST" ]]; then
+    launchctl unload "$WARM_PLIST_DST" 2>/dev/null || true
+    rm -f "$WARM_PLIST_DST"
+    echo -e "${GREEN}Token warming uninstalled.${RESET}"
+  else
+    echo -e "${DIM}Token warming not installed.${RESET}"
+  fi
+}
+
 case "${1:-}" in
-  add)       cmd_add "${2:-}" ;;
-  remove)    cmd_remove "${2:-}" ;;
-  swap)      shift; cmd_swap "$@" ;;
-  list)      cmd_list ;;
-  sync)      cmd_sync ;;
-  uninstall) cmd_uninstall ;;
-  -h|--help) usage ;;
-  *)         usage ;;
+  add)             cmd_add "${2:-}" ;;
+  remove)          cmd_remove "${2:-}" ;;
+  swap)            shift; cmd_swap "$@" ;;
+  list)            cmd_list ;;
+  sync)            cmd_sync ;;
+  warm)            cmd_warm ;;
+  warm-setup)      cmd_warm_setup ;;
+  warm-uninstall)  cmd_warm_uninstall ;;
+  uninstall)       cmd_uninstall ;;
+  -h|--help)       usage ;;
+  *)               usage ;;
 esac

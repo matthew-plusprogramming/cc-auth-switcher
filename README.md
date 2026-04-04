@@ -100,13 +100,26 @@ cc-switch remove client-x   # remove a profile
 cc-switch uninstall         # remove everything
 ```
 
-## Token refresh
+## Token warming
 
-Inactive profiles' OAuth tokens will expire if not refreshed. Two options:
+Inactive profiles' OAuth tokens expire if not used. The `warm` command keeps them alive by running a minimal Claude Code session against each profile that needs it. It also syncs `~/.claude` credentials back to the active profile first, so any token refreshes from your running session (or `/login`) propagate automatically.
 
-1. **[cc-rate-balancer](https://github.com/matthew-plusprogramming/cc-rate-balancer)** (recommended) — runs a minimal Claude Code session against each inactive profile every 30 minutes, letting CC refresh its own tokens. Also monitors rate limits and auto-swaps profiles.
+**Run manually:**
 
-2. **Manual** — just run the alias (e.g. `work`) periodically. Claude Code refreshes its token on startup.
+```bash
+cc-switch warm
+```
+
+**Run automatically (recommended):**
+
+```bash
+cc-switch warm-setup         # installs launchd job, runs every 30 minutes
+cc-switch warm-uninstall     # removes it
+```
+
+The warmer checks each profile's token expiry and skips profiles that are still fresh (>60 min remaining). Logs are written to `~/.cc-switch/warm.log`.
+
+For automatic rate-limit-based account switching, see [cc-rate-balancer](https://github.com/matthew-plusprogramming/cc-rate-balancer).
 
 ## FAQ
 
