@@ -150,7 +150,17 @@ cmd_remove() {
 }
 
 cmd_swap() {
-  local name="${1:-}"
+  local from_profile="" force=false name=""
+
+  # Parse flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)  from_profile="$2"; shift 2 ;;
+      --force) force=true; shift ;;
+      *)       name="$1"; shift ;;
+    esac
+  done
+
   validate_name "$name"
   check_claude
 
@@ -162,14 +172,32 @@ cmd_swap() {
     exit 1
   fi
 
-  # Sync credentials back to the previously swapped-in profile
-  if [[ -f "$swap_marker" ]]; then
-    local prev
-    prev=$(cat "$swap_marker")
-    local prev_dir="$HOME/.claude-$prev"
-    if [[ -d "$prev_dir" && -f "$CLAUDE_HOME/.credentials.json" ]]; then
-      cp "$CLAUDE_HOME/.credentials.json" "$prev_dir/.credentials.json"
-      echo -e "${DIM}Synced credentials back to ${prev}${RESET}"
+  # --from overrides the marker for bootstrap
+  if [[ -n "$from_profile" ]]; then
+    echo "$from_profile" > "$swap_marker"
+    echo -e "${DIM}Set current profile to ${from_profile}${RESET}"
+  fi
+
+  # Save current .claude credentials back to the profile we're leaving
+  if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
+    if [[ -f "$swap_marker" ]]; then
+      local prev
+      prev=$(cat "$swap_marker")
+      local prev_dir="$HOME/.claude-$prev"
+      if [[ -d "$prev_dir" ]]; then
+        cp "$CLAUDE_HOME/.credentials.json" "$prev_dir/.credentials.json"
+        echo -e "${DIM}Saved credentials back to ${prev}${RESET}"
+      fi
+    else
+      if [[ "$force" == true ]]; then
+        echo -e "${DIM}No marker — skipping save-back (--force)${RESET}"
+      else
+        echo -e "${RED}Warning:${RESET} No active profile marker found."
+        echo -e "Cannot save current credentials back. Which profile are you on now?"
+        echo -e "  ${BOLD}cc-switch swap --from <current> $name${RESET}  (saves current creds to <current> first)"
+        echo -e "  ${BOLD}cc-switch swap --force $name${RESET}            (skip saving, just overwrite)"
+        exit 1
+      fi
     fi
   fi
 
@@ -244,7 +272,7 @@ cmd_uninstall() {
 case "${1:-}" in
   add)       cmd_add "${2:-}" ;;
   remove)    cmd_remove "${2:-}" ;;
-  swap)      cmd_swap "${2:-}" ;;
+  swap)      shift; cmd_swap "$@" ;;
   list)      cmd_list ;;
   sync)      cmd_sync ;;
   uninstall) cmd_uninstall ;;
