@@ -155,13 +155,26 @@ cmd_swap() {
   check_claude
 
   local profile_creds="$HOME/.claude-$name/.credentials.json"
+  local swap_marker="$CLAUDE_HOME/.cc-swap-active"
 
   if [[ ! -f "$profile_creds" ]]; then
     echo -e "${RED}Error:${RESET} Profile '$name' has no credentials. Log in first by running: $name"
     exit 1
   fi
 
+  # Sync credentials back to the previously swapped-in profile
+  if [[ -f "$swap_marker" ]]; then
+    local prev
+    prev=$(cat "$swap_marker")
+    local prev_dir="$HOME/.claude-$prev"
+    if [[ -d "$prev_dir" && -f "$CLAUDE_HOME/.credentials.json" ]]; then
+      cp "$CLAUDE_HOME/.credentials.json" "$prev_dir/.credentials.json"
+      echo -e "${DIM}Synced credentials back to ${prev}${RESET}"
+    fi
+  fi
+
   cp "$profile_creds" "$CLAUDE_HOME/.credentials.json"
+  echo "$name" > "$swap_marker"
   echo -e "${GREEN}Swapped.${RESET} ${BOLD}claude${RESET} now uses ${BOLD}$name${RESET} credentials."
 }
 
