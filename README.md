@@ -70,7 +70,26 @@ cc-switch swap personal     # swap again
 claude                      # now uses personal credentials
 ```
 
-This copies the profile's `.credentials.json` directly into `~/.claude/`. No aliases needed, no env vars — plain `claude` just works with whichever account you last swapped to. One command to switch.
+This swaps credentials in and out of `~/.claude/`. When you swap to a new profile, your current credentials are **automatically saved back** to the profile you were on. Plain `claude` just works with whichever account you last swapped to.
+
+**First-time swap** — since there's no marker yet, you need to tell it which profile you're currently on:
+
+```bash
+cc-switch swap --from work personal   # "I'm on work, switch to personal"
+```
+
+After the first swap, the marker is set and future swaps save back automatically:
+
+```bash
+cc-switch swap work                   # saves personal → ~/.claude-personal, loads work
+cc-switch swap personal               # saves work → ~/.claude-work, loads personal
+```
+
+If you don't care about saving the current credentials (e.g. they're expired):
+
+```bash
+cc-switch swap --force work           # just overwrite, don't save back
+```
 
 ### Manage
 
@@ -80,6 +99,14 @@ cc-switch sync              # re-sync symlinks after Claude updates
 cc-switch remove client-x   # remove a profile
 cc-switch uninstall         # remove everything
 ```
+
+## Token refresh
+
+Inactive profiles' OAuth tokens will expire if not refreshed. Two options:
+
+1. **[cc-rate-balancer](https://github.com/matthew-plusprogramming/cc-rate-balancer)** (recommended) — runs a minimal Claude Code session against each inactive profile every 30 minutes, letting CC refresh its own tokens. Also monitors rate limits and auto-swaps profiles.
+
+2. **Manual** — just run the alias (e.g. `work`) periodically. Claude Code refreshes its token on startup.
 
 ## FAQ
 
