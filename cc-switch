@@ -304,7 +304,7 @@ _token_needs_warm() {
   local creds_file="$1"
   local expires_at
   # Extract expiresAt from JSON without jq — works because it's always a number
-  expires_at=$(grep -o '"expiresAt":[0-9]*' "$creds_file" 2>/dev/null | grep -o '[0-9]*')
+  expires_at=$(grep -o '"expiresAt":[0-9]*' "$creds_file" 2>/dev/null | head -1 | grep -o '[0-9]*')
   if [[ -z "$expires_at" ]]; then
     return 0  # can't tell, warm it
   fi
