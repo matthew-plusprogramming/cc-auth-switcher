@@ -285,6 +285,19 @@ _warm_log() {
   echo "${ts} $1" >> "$WARM_LOG_FILE"
 }
 
+_run_with_timeout() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+  local watcher=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  return $rc
+}
+
 _find_claude() {
   local candidate
   for candidate in \
@@ -363,7 +376,7 @@ cmd_warm() {
     fi
 
     _warm_log "[${name}] Warming token..."
-    if timeout 120 env CLAUDE_CONFIG_DIR="$profile_dir" "$claude_bin" -p "hi" --max-turns 1 >/dev/null 2>&1; then
+    if _run_with_timeout 120 env CLAUDE_CONFIG_DIR="$profile_dir" "$claude_bin" -p "hi" --max-turns 1 >/dev/null 2>&1; then
       _warm_log "[${name}] Token warmed"
       echo -e "  ${BOLD}$name${RESET}  ${GREEN}warmed${RESET}"
       ((warmed++))
