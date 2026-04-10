@@ -108,6 +108,42 @@ get_profiles() {
   grep "# cc-switch:" "$SHELL_RC" 2>/dev/null | sed 's/.*# cc-switch: //' || true
 }
 
+# --- Keychain helpers ---
+# Claude Code stores credentials in the macOS Keychain, keyed by config dir hash.
+
+_keychain_service() {
+  local dir="$1"
+  if [[ "$dir" == "$CLAUDE_HOME" ]]; then
+    echo "Claude Code-credentials"
+  else
+    local hash
+    hash=$(echo -n "$dir" | shasum -a 256 | cut -c1-8)
+    echo "Claude Code-credentials-${hash}"
+  fi
+}
+
+_keychain_exists() {
+  local service
+  service=$(_keychain_service "$1")
+  security find-generic-password -s "$service" >/dev/null 2>&1
+}
+
+_keychain_read() {
+  local service
+  service=$(_keychain_service "$1")
+  security find-generic-password -s "$service" -w 2>/dev/null
+}
+
+_keychain_write() {
+  local dir="$1"
+  local data="$2"
+  local service account
+  service=$(_keychain_service "$dir")
+  account=$(whoami)
+  security delete-generic-password -s "$service" -a "$account" >/dev/null 2>&1 || true
+  security add-generic-password -s "$service" -a "$account" -w "$data" 2>/dev/null
+}
+
 cmd_add() {
   local name="${1:-}"
   validate_name "$name"
@@ -167,10 +203,11 @@ cmd_swap() {
   validate_name "$name"
   check_claude
 
-  local profile_creds="$HOME/.claude-$name/.credentials.json"
+  local target_dir="$HOME/.claude-$name"
   local swap_marker="$CLAUDE_HOME/.cc-swap-active"
 
-  if [[ ! -f "$profile_creds" ]]; then
+  # Check target has credentials (keychain or file)
+  if ! _keychain_exists "$target_dir" && [[ ! -f "$target_dir/.credentials.json" ]]; then
     echo -e "${RED}Error:${RESET} Profile '$name' has no credentials. Log in first by running: $name"
     exit 1
   fi
@@ -181,30 +218,46 @@ cmd_swap() {
     echo -e "${DIM}Set current profile to ${from_profile}${RESET}"
   fi
 
-  # Save current .claude credentials back to the profile we're leaving
-  if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
-    if [[ -f "$swap_marker" ]]; then
-      local prev
-      prev=$(cat "$swap_marker")
-      local prev_dir="$HOME/.claude-$prev"
-      if [[ -d "$prev_dir" ]]; then
+  # Save current credentials back to the profile we're leaving
+  if [[ -f "$swap_marker" ]]; then
+    local prev
+    prev=$(cat "$swap_marker" | tr -d '[:space:]')
+    local prev_dir="$HOME/.claude-$prev"
+    if [[ -d "$prev_dir" ]]; then
+      # Save keychain credentials
+      local default_creds
+      default_creds=$(_keychain_read "$CLAUDE_HOME") || true
+      if [[ -n "$default_creds" ]]; then
+        _keychain_write "$prev_dir" "$default_creds"
+      fi
+      # Save file credentials (MCP OAuth)
+      if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
         cp "$CLAUDE_HOME/.credentials.json" "$prev_dir/.credentials.json"
-        echo -e "${DIM}Saved credentials back to ${prev}${RESET}"
       fi
-    else
-      if [[ "$force" == true ]]; then
-        echo -e "${DIM}No marker — skipping save-back (--force)${RESET}"
-      else
-        echo -e "${RED}Warning:${RESET} No active profile marker found."
-        echo -e "Cannot save current credentials back. Which profile are you on now?"
-        echo -e "  ${BOLD}cc-switch swap --from <current> $name${RESET}  (saves current creds to <current> first)"
-        echo -e "  ${BOLD}cc-switch swap --force $name${RESET}            (skip saving, just overwrite)"
-        exit 1
-      fi
+      echo -e "${DIM}Saved credentials back to ${prev}${RESET}"
     fi
+  elif [[ "$force" != true ]]; then
+    echo -e "${RED}Warning:${RESET} No active profile marker found."
+    echo -e "Cannot save current credentials back. Which profile are you on now?"
+    echo -e "  ${BOLD}cc-switch swap --from <current> $name${RESET}  (saves current creds to <current> first)"
+    echo -e "  ${BOLD}cc-switch swap --force $name${RESET}            (skip saving, just overwrite)"
+    exit 1
+  else
+    echo -e "${DIM}No marker — skipping save-back (--force)${RESET}"
   fi
 
-  cp "$profile_creds" "$CLAUDE_HOME/.credentials.json"
+  # Copy target's keychain credentials to default
+  local target_creds
+  target_creds=$(_keychain_read "$target_dir") || true
+  if [[ -n "$target_creds" ]]; then
+    _keychain_write "$CLAUDE_HOME" "$target_creds"
+  fi
+
+  # Copy file credentials (MCP OAuth)
+  if [[ -f "$target_dir/.credentials.json" ]]; then
+    cp "$target_dir/.credentials.json" "$CLAUDE_HOME/.credentials.json"
+  fi
+
   echo "$name" > "$swap_marker"
   echo -e "${GREEN}Swapped.${RESET} ${BOLD}claude${RESET} now uses ${BOLD}$name${RESET} credentials."
 }
@@ -221,8 +274,8 @@ cmd_list() {
   echo -e "${BOLD}Configured accounts:${RESET}"
   echo ""
   while IFS= read -r name; do
-    local creds="$HOME/.claude-$name/.credentials.json"
-    if [[ -f "$creds" ]]; then
+    local profile_dir="$HOME/.claude-$name"
+    if _keychain_exists "$profile_dir" || [[ -f "$profile_dir/.credentials.json" ]]; then
       echo -e "  ${BOLD}$name${RESET}  ${GREEN}logged in${RESET}"
     else
       echo -e "  ${BOLD}$name${RESET}  ${DIM}not yet logged in${RESET}"
@@ -314,10 +367,11 @@ _find_claude() {
 
 # Check if a profile's token expires within the next 60 minutes
 _token_needs_warm() {
-  local creds_file="$1"
-  local expires_at
-  # Extract expiresAt from JSON without jq — works because it's always a number
-  expires_at=$(grep -o '"expiresAt":[0-9]*' "$creds_file" 2>/dev/null | head -1 | grep -o '[0-9]*')
+  local profile_dir="$1"
+  local creds expires_at
+  creds=$(_keychain_read "$profile_dir") || return 0
+  # Extract claudeAiOauth expiresAt (appears first in the JSON)
+  expires_at=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | head -1 | grep -o '[0-9]*')
   if [[ -z "$expires_at" ]]; then
     return 0  # can't tell, warm it
   fi
@@ -341,11 +395,18 @@ cmd_warm() {
     active=$(cat "$swap_marker" | tr -d '[:space:]')
   fi
 
-  # Sync .claude credentials back to active profile
-  if [[ -n "$active" && -f "$CLAUDE_HOME/.credentials.json" ]]; then
+  # Sync default keychain credentials back to active profile
+  if [[ -n "$active" ]]; then
     local active_dir="$HOME/.claude-$active"
     if [[ -d "$active_dir" ]]; then
-      cp "$CLAUDE_HOME/.credentials.json" "$active_dir/.credentials.json"
+      local default_creds
+      default_creds=$(_keychain_read "$CLAUDE_HOME") || true
+      if [[ -n "$default_creds" ]]; then
+        _keychain_write "$active_dir" "$default_creds"
+      fi
+      if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
+        cp "$CLAUDE_HOME/.credentials.json" "$active_dir/.credentials.json"
+      fi
       _warm_log "[${active}] Synced credentials from .claude"
     fi
   fi
@@ -361,15 +422,20 @@ cmd_warm() {
 
   while IFS= read -r name; do
     local profile_dir="$HOME/.claude-$name"
-    local creds="$profile_dir/.credentials.json"
 
-    if [[ ! -f "$creds" ]]; then
+    # Skip the active profile — tokens refresh through normal use
+    if [[ "$name" == "$active" ]]; then
+      ((skipped++))
+      continue
+    fi
+
+    if ! _keychain_exists "$profile_dir"; then
       _warm_log "[${name}] No credentials — skipping"
       ((skipped++))
       continue
     fi
 
-    if ! _token_needs_warm "$creds"; then
+    if ! _token_needs_warm "$profile_dir"; then
       _warm_log "[${name}] Token still fresh — skipping"
       ((skipped++))
       continue
