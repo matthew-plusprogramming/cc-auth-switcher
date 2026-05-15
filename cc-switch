@@ -144,6 +144,12 @@ _keychain_write() {
   security add-generic-password -s "$service" -a "$account" -w "$data" 2>/dev/null
 }
 
+_keychain_delete() {
+  local service
+  service=$(_keychain_service "$1")
+  security delete-generic-password -s "$service" >/dev/null 2>&1
+}
+
 cmd_add() {
   local name="${1:-}"
   validate_name "$name"
@@ -177,6 +183,11 @@ cmd_remove() {
   if [[ -d "$profile_dir" ]]; then
     rm -rf "$profile_dir"
     echo -e "${RED}-${RESET} Removed ~/.claude-$name"
+  fi
+
+  if _keychain_exists "$profile_dir"; then
+    _keychain_delete "$profile_dir"
+    echo -e "${RED}-${RESET} Removed keychain credentials"
   fi
 
   if [[ -f "$SHELL_RC" ]]; then
