@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# cc-switch - Dead simple Claude Code auth switcher
-# Shares all config between accounts. Only credentials are separate.
+# cc-switch - Claude Code auth switcher
+# Each profile is a CLAUDE_CONFIG_DIR with its own native Claude Code login.
+# Claude Code owns the credential; cc-switch only selects which config dir to use.
+# setup-token auth stays available for headless use via `run --token`.
 # https://github.com/matthew-plusprogramming/cc-auth-switcher
 
 set -euo pipefail
@@ -9,8 +11,18 @@ CLAUDE_HOME="${HOME}/.claude"
 SHELL_RC="${HOME}/.zshrc"
 [[ -f "${HOME}/.bashrc" && ! -f "${HOME}/.zshrc" ]] && SHELL_RC="${HOME}/.bashrc"
 
+CC_SWITCH_HOME="${CC_SWITCH_HOME:-${HOME}/.cc-switch}"
+CC_SWITCH_PROFILES_DIR="${CC_SWITCH_HOME}/profiles"
+CC_SWITCH_TOKENS_DIR="${CC_SWITCH_HOME}/tokens"
+CC_SWITCH_ACTIVE_FILE="${CC_SWITCH_HOME}/active-profile"
+CC_SWITCH_CONFIG_FILE="${CC_SWITCH_HOME}/config.json"
+CC_SWITCH_LEGACY_ACTIVE_FILE="${CLAUDE_HOME}/.cc-swap-active"
+CC_SWITCH_TOKEN_SERVICE="${CC_SWITCH_TOKEN_SERVICE:-cc-auth-switcher-token}"
+CC_SWITCH_SHELL_WRAPPER_MARKER="claude-wrapper"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 DIM='\033[2m'
 BOLD='\033[1m'
 RESET='\033[0m'
@@ -22,347 +34,357 @@ cc-switch - Claude Code auth switcher
 Usage: cc-switch <command>
 
 Commands:
-  add <name>      Create a new account profile and shell alias
-  remove <name>   Remove an account profile and its alias
-  swap <name>     Swap ~/.claude auth to a profile (use plain 'claude')
-  list            Show configured accounts
-  sync            Re-sync symlinks (run after Claude adds new config files)
-  warm            Refresh tokens for inactive profiles
-  warm-setup      Install launchd job to warm every 30 minutes
-  warm-uninstall  Remove the warming launchd job
-  uninstall       Remove all profiles and aliases
+  add <name>             Create a profile config dir and shell alias
+  login <name>           Sign in to a profile (browser login, keeps subscription)
+  logout <name>          Sign out of a profile
+  run <name> [args...]   Run Claude Code with a profile
+  use <name>             Set the active profile for run-active/plain claude
+  run-active [args...]   Run Claude Code with the active profile
+  swap <name>            Compatibility alias for use
+  validate <name|--all>  Check each profile's login state
+  list                   Show configured profiles and their accounts
+  shell-setup            Install aliases and the plain claude function
+  claude-bin [path]      Show or set the real Claude Code binary path
+  doctor                 Show switcher diagnostics
+  remove <name>          Remove a profile, alias, and stored token
+  uninstall              Remove cc-switch profiles, aliases, and stored tokens
+
+Headless / CI (setup-token auth, billed as API, no subscription):
+  token add <name>       Store a claude setup-token token
+  token remove <name>    Remove a stored profile token
+  token list             List profiles without printing tokens
+  run --token <name>     Run Claude Code with the profile's token instead
+
+Deprecated compatibility commands:
+  sync                   Re-link shared config into profile dirs
+  warm                   Runs validate --all instead of token warming
+  warm-setup             Refuses to install the old warming job
+  warm-uninstall         Removes the old warming job if present
+
+Notes:
+  Profiles use CLAUDE_CONFIG_DIR (default ~/.claude-<name>), so each keeps its
+  own Claude Code login and its own subscription. The reserved profile name
+  'default' maps to ~/.claude, your normal login.
 
 Examples:
-  cc-switch add work        # creates 'work' alias and ~/.claude-work
-  cc-switch add personal    # creates 'personal' alias and ~/.claude-personal
-  cc-switch remove personal # removes it
-
-Use named aliases (each profile has its own config dir):
-  work                      # Claude Code with work account
-  personal                  # Claude Code with personal account
-
-Or swap in-place (simplest — just swaps auth in ~/.claude):
-  cc-switch swap work       # now plain 'claude' uses work credentials
+  cc-switch add cc1
+  cc-switch login cc1
+  cc-switch use cc1        # plain 'claude' now runs as cc1
+  cc-switch use default    # plain 'claude' back to ~/.claude
+  cc-switch run cc2 -p "hi" --max-turns 1
+  cc-switch list
 EOF
 }
 
-check_claude() {
-  if [[ ! -d "$CLAUDE_HOME" ]]; then
-    echo -e "${RED}Error:${RESET} ~/.claude not found. Run Claude Code at least once first."
-    exit 1
-  fi
+die() {
+  echo -e "${RED}Error:${RESET} $1" >&2
+  exit "${2:-1}"
+}
+
+note() {
+  echo -e "${DIM}$1${RESET}"
 }
 
 validate_name() {
-  local name="$1"
+  local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo -e "${RED}Error:${RESET} Profile name required."
-    echo "Usage: cc-switch add <name>"
-    exit 1
+    die "Profile name required."
   fi
   if [[ "$name" =~ [^a-zA-Z0-9_-] ]]; then
-    echo -e "${RED}Error:${RESET} Profile name can only contain letters, numbers, hyphens, and underscores."
-    exit 1
+    die "Profile name can only contain letters, numbers, hyphens, and underscores."
   fi
 }
 
-# Symlink everything from ~/.claude into a profile dir, except credentials
-link_profile() {
-  local profile_dir="$1"
-  mkdir -p "$profile_dir"
+_now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
 
-  # Symlink visible files/dirs
+_ensure_switch_home() {
+  mkdir -p "$CC_SWITCH_HOME" "$CC_SWITCH_PROFILES_DIR"
+  chmod 700 "$CC_SWITCH_HOME" "$CC_SWITCH_PROFILES_DIR" 2>/dev/null || true
+}
+
+_profile_dir() {
+  echo "${CC_SWITCH_PROFILES_DIR}/$1"
+}
+
+_profile_meta() {
+  echo "$(_profile_dir "$1")/$2"
+}
+
+_ensure_profile() {
+  local name="$1"
+  validate_name "$name"
+  _ensure_switch_home
+
+  local dir
+  dir=$(_profile_dir "$name")
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  [[ -f "$dir/created-at" ]] || _write_profile_meta "$name" "created-at" "$(_now_utc)"
+}
+
+_write_profile_meta() {
+  local name="$1" key="$2" value="$3"
+  local dir
+  dir=$(_profile_dir "$name")
+  mkdir -p "$dir"
+  printf '%s\n' "$value" > "$dir/$key"
+  chmod 600 "$dir/$key" 2>/dev/null || true
+}
+
+_read_profile_meta() {
+  local file
+  file=$(_profile_meta "$1" "$2")
+  [[ -f "$file" ]] && head -n 1 "$file"
+}
+
+# The reserved profile that maps to the normal ~/.claude login.
+CC_SWITCH_DEFAULT_PROFILE="default"
+
+# Where a profile's Claude Code login lives. Claude Code keys its credential
+# storage off this path, so each profile keeps a separate native login.
+_profile_config_dir() {
+  local name="$1" configured
+  if [[ "$name" == "$CC_SWITCH_DEFAULT_PROFILE" ]]; then
+    printf '%s\n' "$CLAUDE_HOME"
+    return 0
+  fi
+  configured=$(_read_profile_meta "$name" "config-dir" || true)
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+  else
+    printf '%s\n' "${HOME}/.claude-${name}"
+  fi
+}
+
+# config-dir = native login (keeps subscription). token = setup-token (API billing).
+_profile_auth_mode() {
+  local mode
+  mode=$(_read_profile_meta "$1" "auth-mode" || true)
+  printf '%s\n' "${mode:-config-dir}"
+}
+
+# Claude Code names its macOS keychain item after the config dir path.
+_keychain_item() {
+  local dir="$1" suffix
+  if _same_path "$dir" "$CLAUDE_HOME"; then
+    printf 'Claude Code-credentials\n'
+    return 0
+  fi
+  suffix=$(printf '%s' "$dir" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | cut -c1-8)
+  if [[ -z "$suffix" ]]; then
+    printf 'Claude Code-credentials-?\n'
+  else
+    printf 'Claude Code-credentials-%s\n' "$suffix"
+  fi
+}
+
+# Run Claude Code against a profile's config dir.
+#
+# CLAUDE_CODE_OAUTH_TOKEN is always stripped: an inherited setup-token would
+# override the profile's own login and silently downgrade the session to API
+# auth. For the default profile CLAUDE_CONFIG_DIR is left unset rather than
+# pointed at ~/.claude, because setting it explicitly makes Claude Code read
+# <dir>/.claude.json and lose the account email/org it reports.
+_claude_in_dir() {
+  local dir="$1"; shift
+  local claude_bin
+  claude_bin=$(_find_claude) || return 1
+  if _same_path "$dir" "$CLAUDE_HOME"; then
+    env -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CONFIG_DIR "$claude_bin" "$@"
+  else
+    env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="$dir" "$claude_bin" "$@"
+  fi
+}
+
+_exec_claude_in_dir() {
+  local dir="$1"; shift
+  local claude_bin
+  claude_bin=$(_find_claude) || return 1
+  if _same_path "$dir" "$CLAUDE_HOME"; then
+    exec env -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CONFIG_DIR "$claude_bin" "$@"
+  else
+    exec env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="$dir" "$claude_bin" "$@"
+  fi
+}
+
+_auth_status_json() {
+  _claude_in_dir "$1" auth status 2>/dev/null
+}
+
+_json_string_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+_json_is_true() {
+  printf '%s' "$1" | grep -q "\"$2\"[[:space:]]*:[[:space:]]*true"
+}
+
+# Share settings, memory, hooks, agents, and projects with ~/.claude while
+# keeping credentials and per-profile state separate.
+_link_shared_config() {
+  local dir="$1" item name
+  [[ -d "$CLAUDE_HOME" ]] || return 0
+  if _same_path "$dir" "$CLAUDE_HOME"; then
+    return 0
+  fi
+
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+
+  shopt -s dotglob nullglob
   for item in "$CLAUDE_HOME"/*; do
-    [[ ! -e "$item" ]] && continue
-    local name
     name=$(basename "$item")
-    if [[ -L "$profile_dir/$name" && "$(readlink "$profile_dir/$name")" == "$item" ]]; then
-      continue
-    fi
-    [[ -e "$profile_dir/$name" || -L "$profile_dir/$name" ]] && rm -rf "$profile_dir/$name"
-    ln -s "$item" "$profile_dir/$name"
-  done
-
-  # Symlink hidden files/dirs (except .credentials.json)
-  for item in "$CLAUDE_HOME"/.*; do
-    [[ ! -e "$item" ]] && continue
-    local name
-    name=$(basename "$item")
-    [[ "$name" == "." || "$name" == ".." ]] && continue
-    [[ "$name" == ".credentials.json" ]] && continue
-    if [[ -L "$profile_dir/$name" && "$(readlink "$profile_dir/$name")" == "$item" ]]; then
-      continue
-    fi
-    [[ -e "$profile_dir/$name" || -L "$profile_dir/$name" ]] && rm -rf "$profile_dir/$name"
-    ln -s "$item" "$profile_dir/$name"
-  done
-
-  # Remove credentials symlink if it exists (each profile owns its own)
-  if [[ -L "$profile_dir/.credentials.json" ]]; then
-    rm "$profile_dir/.credentials.json"
-  fi
-}
-
-# Get all profile names from shell rc
-get_profiles() {
-  grep "# cc-switch:" "$SHELL_RC" 2>/dev/null | sed 's/.*# cc-switch: //' || true
-}
-
-# --- Keychain helpers ---
-# Claude Code stores credentials in the macOS Keychain, keyed by config dir hash.
-
-_keychain_service() {
-  local dir="$1"
-  if [[ "$dir" == "$CLAUDE_HOME" ]]; then
-    echo "Claude Code-credentials"
-  else
-    local hash
-    hash=$(echo -n "$dir" | shasum -a 256 | cut -c1-8)
-    echo "Claude Code-credentials-${hash}"
-  fi
-}
-
-_keychain_exists() {
-  local service
-  service=$(_keychain_service "$1")
-  security find-generic-password -s "$service" >/dev/null 2>&1
-}
-
-_keychain_read() {
-  local service
-  service=$(_keychain_service "$1")
-  security find-generic-password -s "$service" -w 2>/dev/null
-}
-
-_keychain_write() {
-  local dir="$1"
-  local data="$2"
-  local service account
-  service=$(_keychain_service "$dir")
-  account=$(whoami)
-  security delete-generic-password -s "$service" -a "$account" >/dev/null 2>&1 || true
-  security add-generic-password -s "$service" -a "$account" -w "$data" 2>/dev/null
-}
-
-_keychain_delete() {
-  local service
-  service=$(_keychain_service "$1")
-  security delete-generic-password -s "$service" >/dev/null 2>&1
-}
-
-cmd_add() {
-  local name="${1:-}"
-  validate_name "$name"
-  check_claude
-
-  local profile_dir="$HOME/.claude-$name"
-
-  # Check if already exists
-  if grep -q "# cc-switch: $name" "$SHELL_RC" 2>/dev/null; then
-    echo -e "${DIM}Profile '$name' already exists.${RESET}"
-    return
-  fi
-
-  link_profile "$profile_dir"
-
-  # Add alias to shell rc
-  echo "alias $name='CLAUDE_CONFIG_DIR=~/.claude-$name claude' # cc-switch: $name" >> "$SHELL_RC"
-
-  echo -e "${GREEN}+${RESET} Created profile ${BOLD}$name${RESET}"
-  echo -e "  ${DIM}Config: ~/.claude-$name${RESET}"
-  echo ""
-  echo -e "Run: ${BOLD}source $SHELL_RC${RESET} then ${BOLD}$name${RESET} to log in"
-}
-
-cmd_remove() {
-  local name="${1:-}"
-  validate_name "$name"
-
-  local profile_dir="$HOME/.claude-$name"
-
-  if [[ -d "$profile_dir" ]]; then
-    rm -rf "$profile_dir"
-    echo -e "${RED}-${RESET} Removed ~/.claude-$name"
-  fi
-
-  if _keychain_exists "$profile_dir"; then
-    _keychain_delete "$profile_dir"
-    echo -e "${RED}-${RESET} Removed keychain credentials"
-  fi
-
-  if [[ -f "$SHELL_RC" ]]; then
-    sed -i '' "/# cc-switch: $name$/d" "$SHELL_RC"
-    echo -e "${RED}-${RESET} Removed alias from $(basename "$SHELL_RC")"
-  fi
-
-  echo ""
-  echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
-}
-
-cmd_swap() {
-  local from_profile="" force=false name=""
-
-  # Parse flags
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --from)  from_profile="$2"; shift 2 ;;
-      --force) force=true; shift ;;
-      *)       name="$1"; shift ;;
+    case "$name" in
+      .|..|.credentials.json|.claude.json|.cc-swap-active|.last-cleanup|.last-update-result.json)
+        continue
+        ;;
     esac
+    if [[ -L "$dir/$name" && "$(readlink "$dir/$name")" == "$item" ]]; then
+      continue
+    fi
+    # Never replace a real per-profile file with a shared symlink.
+    if [[ -e "$dir/$name" && ! -L "$dir/$name" ]]; then
+      continue
+    fi
+    rm -rf "$dir/$name"
+    ln -s "$item" "$dir/$name"
   done
+  shopt -u dotglob nullglob
+}
 
-  validate_name "$name"
-  check_claude
-
-  local target_dir="$HOME/.claude-$name"
-  local swap_marker="$CLAUDE_HOME/.cc-swap-active"
-
-  # Check target has credentials (keychain or file)
-  if ! _keychain_exists "$target_dir" && [[ ! -f "$target_dir/.credentials.json" ]]; then
-    echo -e "${RED}Error:${RESET} Profile '$name' has no credentials. Log in first by running: $name"
-    exit 1
+# Prints a short human summary of a profile's login state.
+_login_summary() {
+  local dir="$1" json email plan
+  json=$(_auth_status_json "$dir" || true)
+  if [[ -z "$json" ]]; then
+    printf '%b\n' "${DIM}unknown${RESET}"
+    return 0
   fi
-
-  # --from overrides the marker for bootstrap
-  if [[ -n "$from_profile" ]]; then
-    echo "$from_profile" > "$swap_marker"
-    echo -e "${DIM}Set current profile to ${from_profile}${RESET}"
+  if ! _json_is_true "$json" "loggedIn"; then
+    printf '%b\n' "${RED}logged out${RESET}"
+    return 0
   fi
-
-  # Save current credentials back to the profile we're leaving
-  if [[ -f "$swap_marker" ]]; then
-    local prev
-    prev=$(cat "$swap_marker" | tr -d '[:space:]')
-    local prev_dir="$HOME/.claude-$prev"
-    if [[ -d "$prev_dir" ]]; then
-      # Save keychain credentials
-      local default_creds
-      default_creds=$(_keychain_read "$CLAUDE_HOME") || true
-      if [[ -n "$default_creds" ]]; then
-        _keychain_write "$prev_dir" "$default_creds"
-      fi
-      # Save file credentials (MCP OAuth)
-      if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
-        cp "$CLAUDE_HOME/.credentials.json" "$prev_dir/.credentials.json"
-      fi
-      echo -e "${DIM}Saved credentials back to ${prev}${RESET}"
-    fi
-  elif [[ "$force" != true ]]; then
-    echo -e "${RED}Warning:${RESET} No active profile marker found."
-    echo -e "Cannot save current credentials back. Which profile are you on now?"
-    echo -e "  ${BOLD}cc-switch swap --from <current> $name${RESET}  (saves current creds to <current> first)"
-    echo -e "  ${BOLD}cc-switch swap --force $name${RESET}            (skip saving, just overwrite)"
-    exit 1
+  email=$(_json_string_field "$json" "email")
+  plan=$(_json_string_field "$json" "subscriptionType")
+  if [[ -n "$email" ]]; then
+    printf '%b\n' "${GREEN}${email}${RESET}${plan:+ ${DIM}(${plan})${RESET}}"
   else
-    echo -e "${DIM}No marker — skipping save-back (--force)${RESET}"
+    printf '%b\n' "${GREEN}logged in${RESET} ${DIM}($(_json_string_field "$json" "authMethod"))${RESET}"
   fi
-
-  # Copy target's keychain credentials to default
-  local target_creds
-  target_creds=$(_keychain_read "$target_dir") || true
-  if [[ -n "$target_creds" ]]; then
-    _keychain_write "$CLAUDE_HOME" "$target_creds"
-  fi
-
-  # Copy file credentials (MCP OAuth)
-  if [[ -f "$target_dir/.credentials.json" ]]; then
-    cp "$target_dir/.credentials.json" "$CLAUDE_HOME/.credentials.json"
-  fi
-
-  echo "$name" > "$swap_marker"
-  echo -e "${GREEN}Swapped.${RESET} ${BOLD}claude${RESET} now uses ${BOLD}$name${RESET} credentials."
 }
 
-cmd_list() {
-  local profiles
-  profiles=$(get_profiles)
+_legacy_alias_profiles() {
+  [[ -f "$SHELL_RC" ]] || return 0
+  grep "# cc-switch:" "$SHELL_RC" 2>/dev/null \
+    | sed 's/.*# cc-switch: //' \
+    | grep -Ev "^${CC_SWITCH_SHELL_WRAPPER_MARKER}$" || true
+}
 
-  if [[ -z "$profiles" ]]; then
-    echo -e "${DIM}No profiles configured. Run: cc-switch add <name>${RESET}"
-    return
-  fi
-
-  echo -e "${BOLD}Configured accounts:${RESET}"
-  echo ""
-  while IFS= read -r name; do
-    local profile_dir="$HOME/.claude-$name"
-    if _keychain_exists "$profile_dir" || [[ -f "$profile_dir/.credentials.json" ]]; then
-      echo -e "  ${BOLD}$name${RESET}  ${GREEN}logged in${RESET}"
-    else
-      echo -e "  ${BOLD}$name${RESET}  ${DIM}not yet logged in${RESET}"
+_profile_names() {
+  {
+    if [[ -d "$CC_SWITCH_PROFILES_DIR" ]]; then
+      find "$CC_SWITCH_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null \
+        | sed 's|.*/||'
     fi
-  done <<< "$profiles"
-  echo ""
+    _legacy_alias_profiles
+  } | awk 'NF && !seen[$0]++'
 }
 
-cmd_sync() {
-  check_claude
-  local profiles
-  profiles=$(get_profiles)
+_active_profile() {
+  if [[ -f "$CC_SWITCH_ACTIVE_FILE" ]]; then
+    tr -d '[:space:]' < "$CC_SWITCH_ACTIVE_FILE"
+  elif [[ -f "$CC_SWITCH_LEGACY_ACTIVE_FILE" ]]; then
+    tr -d '[:space:]' < "$CC_SWITCH_LEGACY_ACTIVE_FILE"
+  fi
+}
 
-  if [[ -z "$profiles" ]]; then
-    echo -e "${DIM}No profiles to sync.${RESET}"
-    return
+_set_active_profile() {
+  local name="$1"
+  _ensure_switch_home
+  printf '%s\n' "$name" > "$CC_SWITCH_ACTIVE_FILE"
+  chmod 600 "$CC_SWITCH_ACTIVE_FILE" 2>/dev/null || true
+
+  # Keep the legacy marker current so cc-rate-balancer can read the active
+  # profile during Phase 2 without credential mutation.
+  if [[ -d "$CLAUDE_HOME" ]]; then
+    printf '%s\n' "$name" > "$CC_SWITCH_LEGACY_ACTIVE_FILE"
+  fi
+}
+
+_json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
+}
+
+_configured_claude_bin() {
+  if [[ -n "${CC_SWITCH_CLAUDE_BIN:-}" ]]; then
+    echo "$CC_SWITCH_CLAUDE_BIN"
+    return 0
   fi
 
-  while IFS= read -r name; do
-    link_profile "$HOME/.claude-$name"
-  done <<< "$profiles"
-  echo -e "${GREEN}Symlinks synced.${RESET}"
-}
-
-cmd_uninstall() {
-  echo -e "${BOLD}Removing cc-auth-switcher...${RESET}"
-
-  local profiles
-  profiles=$(get_profiles)
-
-  if [[ -n "$profiles" ]]; then
-    while IFS= read -r name; do
-      local dir="$HOME/.claude-$name"
-      if [[ -d "$dir" ]]; then
-        rm -rf "$dir"
-        echo -e "  ${RED}-${RESET} $dir"
-      fi
-    done <<< "$profiles"
+  if [[ -f "$CC_SWITCH_CONFIG_FILE" ]]; then
+    sed -n 's/.*"claude_bin"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CC_SWITCH_CONFIG_FILE" | head -n 1
+    return 0
   fi
+}
 
-  if [[ -f "$SHELL_RC" ]]; then
-    sed -i '' '/# cc-switch: /d' "$SHELL_RC"
-    echo -e "  ${RED}-${RESET} Removed aliases from $(basename "$SHELL_RC")"
+_set_configured_claude_bin() {
+  local path="$1"
+  [[ -x "$path" ]] || die "Claude binary is not executable: $path"
+  _ensure_switch_home
+  printf '{\n  "claude_bin": "%s"\n}\n' "$(_json_escape "$path")" > "$CC_SWITCH_CONFIG_FILE"
+  chmod 600 "$CC_SWITCH_CONFIG_FILE" 2>/dev/null || true
+}
+
+_realpath() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    (cd "$(dirname "$path")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")")
+  else
+    printf '%s\n' "$path"
   fi
-
-  echo ""
-  echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
 }
 
-# --- Token warming ---
-
-WARM_LOG_FILE="${HOME}/.cc-switch/warm.log"
-WARM_PLIST_NAME="com.cc-switch.warm"
-WARM_PLIST_DST="${HOME}/Library/LaunchAgents/${WARM_PLIST_NAME}.plist"
-
-_warm_log() {
-  local ts
-  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  mkdir -p "$(dirname "$WARM_LOG_FILE")"
-  echo "${ts} $1" >> "$WARM_LOG_FILE"
+_same_path() {
+  [[ "$(_realpath "$1")" == "$(_realpath "$2")" ]]
 }
 
-_run_with_timeout() {
-  local secs="$1"; shift
-  "$@" &
-  local pid=$!
-  ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
-  local watcher=$!
-  wait "$pid" 2>/dev/null
-  local rc=$?
-  kill "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
-  return $rc
+_script_path() {
+  _realpath "${BASH_SOURCE[0]}"
+}
+
+_shell_path() {
+  local path="$1"
+  path=${path//\\/\\\\}
+  path=${path//\"/\\\"}
+  printf '"%s"' "$path"
+}
+
+_switch_bin() {
+  local installed=""
+  installed=$(command -v cc-switch 2>/dev/null || true)
+  if [[ -n "$installed" && -x "$installed" ]]; then
+    echo "$installed"
+  else
+    _script_path
+  fi
 }
 
 _find_claude() {
+  local configured=""
+  configured=$(_configured_claude_bin || true)
+  if [[ -n "$configured" ]]; then
+    if [[ -x "$configured" ]]; then
+      echo "$configured"
+      return 0
+    fi
+    die "Configured Claude binary is not executable: $configured"
+  fi
+
   local candidate
   for candidate in \
       "${HOME}/.local/bin/claude" \
@@ -373,166 +395,672 @@ _find_claude() {
       return 0
     fi
   done
+
+  candidate=$(command -v claude 2>/dev/null || true)
+  if [[ -n "$candidate" && -x "$candidate" ]] && ! _same_path "$candidate" "$(_script_path)"; then
+    echo "$candidate"
+    return 0
+  fi
+
   return 1
 }
 
-# Check if a profile's token expires within the next 60 minutes
-_token_needs_warm() {
-  local profile_dir="$1"
-  local creds expires_at
-  creds=$(_keychain_read "$profile_dir") || return 0
-  # Extract claudeAiOauth expiresAt (appears first in the JSON)
-  expires_at=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | head -1 | grep -o '[0-9]*')
-  if [[ -z "$expires_at" ]]; then
-    return 0  # can't tell, warm it
+_token_backend() {
+  if [[ "${CC_SWITCH_TOKEN_BACKEND:-}" == "file" ]]; then
+    echo "file"
+    return 0
   fi
-  local now_ms=$(( $(date +%s) * 1000 ))
-  local threshold_ms=$(( 60 * 60 * 1000 ))  # 60 minutes
-  (( expires_at - now_ms < threshold_ms ))
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v security >/dev/null 2>&1; then
+    echo "keychain"
+    return 0
+  fi
+
+  echo "file"
 }
 
-cmd_warm() {
-  local profiles
-  profiles=$(get_profiles)
+_token_file() {
+  echo "${CC_SWITCH_TOKENS_DIR}/$1.token"
+}
+
+_token_exists() {
+  local name="$1"
+  case "$(_token_backend)" in
+    keychain)
+      security find-generic-password -s "$CC_SWITCH_TOKEN_SERVICE" -a "$name" >/dev/null 2>&1
+      ;;
+    file)
+      [[ -f "$(_token_file "$name")" ]]
+      ;;
+  esac
+}
+
+_token_read() {
+  local name="$1"
+  case "$(_token_backend)" in
+    keychain)
+      security find-generic-password -s "$CC_SWITCH_TOKEN_SERVICE" -a "$name" -w 2>/dev/null
+      ;;
+    file)
+      local file
+      file=$(_token_file "$name")
+      [[ -f "$file" ]] || return 1
+      cat "$file"
+      ;;
+  esac
+}
+
+_token_write() {
+  local name="$1" token="$2"
+  case "$(_token_backend)" in
+    keychain)
+      security add-generic-password -s "$CC_SWITCH_TOKEN_SERVICE" -a "$name" -w "$token" -U >/dev/null
+      ;;
+    file)
+      mkdir -p "$CC_SWITCH_TOKENS_DIR"
+      chmod 700 "$CC_SWITCH_TOKENS_DIR" 2>/dev/null || true
+      umask 077
+      printf '%s\n' "$token" > "$(_token_file "$name")"
+      chmod 600 "$(_token_file "$name")" 2>/dev/null || true
+      ;;
+  esac
+}
+
+_token_delete() {
+  local name="$1"
+  case "$(_token_backend)" in
+    keychain)
+      security delete-generic-password -s "$CC_SWITCH_TOKEN_SERVICE" -a "$name" >/dev/null 2>&1 || true
+      ;;
+    file)
+      rm -f "$(_token_file "$name")"
+      ;;
+  esac
+}
+
+_trim_token() {
+  tr -d '[:space:]'
+}
+
+_record_validation() {
+  local name="$1" status="$2" method="$3"
+  _ensure_profile "$name"
+  _write_profile_meta "$name" "last-validation-status" "$status"
+  _write_profile_meta "$name" "last-validation-at" "$(_now_utc)"
+  _write_profile_meta "$name" "last-validation-method" "$method"
+}
+
+_run_with_timeout() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+  local watcher=$!
+  wait "$pid" 2>/dev/null
+  local rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$rc"
+}
+
+_install_profile_alias() {
+  local name="$1"
+  local switch_bin
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  touch "$SHELL_RC"
+  sed -i '' "/# cc-switch: ${name}$/d" "$SHELL_RC"
+  printf "alias %s='%s run %s' # cc-switch: %s\n" "$name" "$switch_bin" "$name" "$name" >> "$SHELL_RC"
+}
+
+_remove_profile_alias() {
+  local name="$1"
+  [[ -f "$SHELL_RC" ]] || return 0
+  sed -i '' "/# cc-switch: ${name}$/d" "$SHELL_RC"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  validate_name "$name"
+  _ensure_profile "$name"
+
+  local config_dir switch_bin
+  config_dir=$(_profile_config_dir "$name")
+  _write_profile_meta "$name" "config-dir" "$config_dir"
+  _write_profile_meta "$name" "auth-mode" "config-dir"
+  _link_shared_config "$config_dir"
+  _install_profile_alias "$name"
+  switch_bin=$(_shell_path "$(_switch_bin)")
+
+  echo -e "${GREEN}+${RESET} Created profile ${BOLD}$name${RESET}"
+  echo -e "  ${DIM}Config dir: ${config_dir}${RESET}"
+  echo -e "  ${DIM}Shared config linked from: ${CLAUDE_HOME}${RESET}"
+  echo -e "  ${DIM}Alias added to: ${SHELL_RC}${RESET}"
+  echo ""
+  echo -e "Next: ${BOLD}${switch_bin} login $name${RESET}"
+}
+
+cmd_login() {
+  local name="${1:-}"
+  validate_name "$name"
+  _ensure_profile "$name"
+
+  local config_dir claude_bin
+  config_dir=$(_profile_config_dir "$name")
+  claude_bin=$(_find_claude) || die "Claude binary not found. Set it with: cc-switch claude-bin /path/to/claude"
+  _link_shared_config "$config_dir"
+
+  echo -e "${BOLD}Signing in to profile ${name}${RESET}"
+  echo -e "  ${DIM}Config dir: ${config_dir}${RESET}"
+  echo -e "  ${DIM}Keychain item: $(_keychain_item "$config_dir")${RESET}"
+  echo ""
+
+  set +e
+  _claude_in_dir "$config_dir" auth login
+  local rc=$?
+  set -e
+
+  echo ""
+  if [[ "$rc" -ne 0 ]]; then
+    _record_validation "$name" "failed" "config-dir"
+    die "Login did not complete for '$name'."
+  fi
+
+  local json
+  json=$(_auth_status_json "$config_dir" || true)
+  if _json_is_true "$json" "loggedIn"; then
+    _record_validation "$name" "ok" "config-dir"
+    echo -e "${GREEN}Signed in:${RESET} ${BOLD}${name}${RESET}  $(_login_summary "$config_dir")"
+  else
+    _record_validation "$name" "failed" "config-dir"
+    die "Claude Code still reports '$name' as logged out."
+  fi
+}
+
+cmd_logout() {
+  local name="${1:-}"
+  validate_name "$name"
+
+  local config_dir
+  config_dir=$(_profile_config_dir "$name")
+
+  _claude_in_dir "$config_dir" auth logout || true
+  _record_validation "$name" "failed" "config-dir"
+  echo -e "${GREEN}Signed out of ${BOLD}$name${RESET}.${RESET}"
+}
+
+cmd_token_add() {
+  local name="${1:-}"
+  validate_name "$name"
+  [[ $# -le 1 ]] || die "Do not pass tokens as command arguments. Pipe or paste the token instead."
+
+  local token="" switch_bin
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  if [[ -t 0 ]]; then
+    printf "Paste setup-token token for %s: " "$name" >&2
+    IFS= read -r -s token
+    printf "\n" >&2
+  else
+    token=$(cat | _trim_token)
+  fi
+
+  token=$(printf '%s' "$token" | _trim_token)
+  [[ -n "$token" ]] || die "No token provided."
+
+  _ensure_profile "$name"
+  _token_write "$name" "$token"
+  _write_profile_meta "$name" "token-added-at" "$(_now_utc)"
+  rm -f "$(_profile_meta "$name" "last-validation-status")" \
+        "$(_profile_meta "$name" "last-validation-at")" \
+        "$(_profile_meta "$name" "last-validation-method")"
+
+  echo -e "${GREEN}+${RESET} Stored token for ${BOLD}$name${RESET} in $(_token_backend)."
+  echo -e "Validate it with: ${BOLD}${switch_bin} validate $name${RESET}"
+}
+
+cmd_token_remove() {
+  local name="${1:-}"
+  validate_name "$name"
+  _token_delete "$name"
+  rm -f "$(_profile_meta "$name" "last-validation-status")" \
+        "$(_profile_meta "$name" "last-validation-at")" \
+        "$(_profile_meta "$name" "last-validation-method")"
+  echo -e "${GREEN}Removed token for ${BOLD}$name${RESET}.${RESET}"
+}
+
+cmd_token_list() {
+  cmd_list
+}
+
+cmd_token() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    add)     cmd_token_add "$@" ;;
+    remove)  cmd_token_remove "$@" ;;
+    list)    cmd_token_list ;;
+    *)       usage; exit 1 ;;
+  esac
+}
+
+cmd_run() {
+  local use_token=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --token) use_token=1; shift ;;
+      --)      shift; break ;;
+      *)       break ;;
+    esac
+  done
+
+  local name="${1:-}"
+  validate_name "$name"
+  shift || true
+
+  local switch_bin claude_bin mode
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  claude_bin=$(_find_claude) || die "Claude binary not found. Set it with: cc-switch claude-bin /path/to/claude"
+
+  mode=$(_profile_auth_mode "$name")
+  [[ "$use_token" -eq 1 ]] && mode="token"
+
+  if [[ "$mode" == "token" ]]; then
+    _token_exists "$name" || die "Profile '$name' has no setup-token token. Run: ${switch_bin} token add $name"
+    local token
+    token=$(_token_read "$name") || die "Could not read token for profile '$name'."
+
+    if [[ "${CC_SWITCH_DRY_RUN:-}" == "1" ]]; then
+      echo "Would run: $claude_bin $*"
+      echo "Profile: $name"
+      echo "Auth: CLAUDE_CODE_OAUTH_TOKEN (headless; billed as API, not your subscription)"
+      return 0
+    fi
+
+    exec env CLAUDE_CODE_OAUTH_TOKEN="$token" "$claude_bin" "$@"
+  fi
+
+  local config_dir
+  config_dir=$(_profile_config_dir "$name")
+  [[ -d "$config_dir" ]] || die "Profile '$name' has no config dir at ${config_dir}. Run: ${switch_bin} add $name"
+
+  if [[ "${CC_SWITCH_DRY_RUN:-}" == "1" ]]; then
+    echo "Would run: $claude_bin $*"
+    echo "Profile: $name"
+    if _same_path "$config_dir" "$CLAUDE_HOME"; then
+      echo "Auth: default login in ${CLAUDE_HOME} (CLAUDE_CONFIG_DIR unset)"
+    else
+      echo "Auth: CLAUDE_CONFIG_DIR=${config_dir}"
+    fi
+    return 0
+  fi
+
+  _exec_claude_in_dir "$config_dir" "$@"
+}
+
+cmd_run_active() {
+  local active config_dir
+  active=$(_active_profile || true)
+  [[ -n "$active" ]] || active="$CC_SWITCH_DEFAULT_PROFILE"
+
+  # Plain `claude` is wrapped by this command, so never leave the user without a
+  # shell. Fall back to the normal ~/.claude login if the profile is unusable.
+  if [[ "$active" != "$CC_SWITCH_DEFAULT_PROFILE" ]]; then
+    config_dir=$(_profile_config_dir "$active")
+    if [[ ! -d "$config_dir" ]]; then
+      echo -e "${YELLOW}Warning:${RESET} active profile '$active' has no config dir; using ${CLAUDE_HOME}." >&2
+      active="$CC_SWITCH_DEFAULT_PROFILE"
+    fi
+  fi
+
+  cmd_run "$active" "$@"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  validate_name "$name"
+  local switch_bin config_dir
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  config_dir=$(_profile_config_dir "$name")
+
+  if [[ "$name" != "$CC_SWITCH_DEFAULT_PROFILE" ]]; then
+    [[ -d "$config_dir" ]] || die "Profile '$name' has no config dir at ${config_dir}. Run: ${switch_bin} add $name"
+    _ensure_profile "$name"
+    _link_shared_config "$config_dir"
+  fi
+
+  _set_active_profile "$name"
+  echo -e "${GREEN}Active profile:${RESET} ${BOLD}$name${RESET}  $(_login_summary "$config_dir")"
+  echo -e "${DIM}Plain 'claude' and 'cc' now use this profile in new shells.${RESET}"
+}
+
+cmd_swap() {
+  local name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        shift 2
+        ;;
+      --force)
+        shift
+        ;;
+      *)
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die "Profile name required."
+  note "swap is now a compatibility alias for use; it does not copy Claude credentials."
+  cmd_use "$name"
+}
+
+cmd_validate_one() {
+  local name="$1"
+  validate_name "$name"
+  local switch_bin mode
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  mode=$(_profile_auth_mode "$name")
+
+  if [[ "$mode" == "config-dir" ]]; then
+    local config_dir json
+    config_dir=$(_profile_config_dir "$name")
+    if [[ ! -d "$config_dir" ]]; then
+      _record_validation "$name" "failed" "config-dir"
+      echo -e "  ${BOLD}$name${RESET}  ${RED}no config dir${RESET}  ${DIM}${config_dir}${RESET}"
+      return 1
+    fi
+    json=$(_auth_status_json "$config_dir" || true)
+    if _json_is_true "$json" "loggedIn"; then
+      _record_validation "$name" "ok" "config-dir"
+      echo -e "  ${BOLD}$name${RESET}  $(_login_summary "$config_dir")"
+      return 0
+    fi
+    _record_validation "$name" "failed" "config-dir"
+    echo -e "  ${BOLD}$name${RESET}  ${RED}logged out${RESET}  ${DIM}run: cc-switch login $name${RESET}"
+    return 1
+  fi
+
+  _token_exists "$name" || die "Profile '$name' has no setup-token token. Run: ${switch_bin} token add $name"
+
+  local token claude_bin status rc tmp
+  token=$(_token_read "$name") || die "Could not read token for profile '$name'."
+  claude_bin=$(_find_claude) || die "Claude binary not found. Set it with: cc-switch claude-bin /path/to/claude"
+
+  set +e
+  status=$(env CLAUDE_CODE_OAUTH_TOKEN="$token" "$claude_bin" auth status 2>&1)
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 0 && "$status" == *'"loggedIn": true'* ]]; then
+    _record_validation "$name" "ok" "auth-status"
+    echo -e "  ${BOLD}$name${RESET}  ${GREEN}ok${RESET}  ${DIM}auth status accepted token${RESET}"
+    return 0
+  fi
+
+  tmp=$(mktemp -t cc-switch-validate.XXXXXX)
+  if _run_with_timeout 120 env CLAUDE_CODE_OAUTH_TOKEN="$token" "$claude_bin" -p "hi" --max-turns 1 >"$tmp" 2>&1; then
+    rm -f "$tmp"
+    _record_validation "$name" "ok" "prompt"
+    echo -e "  ${BOLD}$name${RESET}  ${GREEN}ok${RESET}  ${DIM}minimal prompt accepted token${RESET}"
+    return 0
+  fi
+
+  rm -f "$tmp"
+  _record_validation "$name" "failed" "prompt"
+  echo -e "  ${BOLD}$name${RESET}  ${RED}failed${RESET}  ${DIM}token was not accepted by Claude Code${RESET}"
+  return 1
+}
+
+cmd_validate() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "Usage: cc-switch validate <name|--all>"
+
+  if [[ "$target" == "--all" ]]; then
+    local profiles failed=0 any=0
+    profiles=$(_profile_names)
+    if [[ -z "$profiles" ]]; then
+      note "No profiles configured."
+      return 0
+    fi
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      if [[ "$(_profile_auth_mode "$name")" == "config-dir" ]] || _token_exists "$name"; then
+        any=1
+        if ! cmd_validate_one "$name"; then
+          failed=$((failed + 1))
+        fi
+      fi
+    done <<< "$profiles"
+    [[ "$any" -eq 1 ]] || note "No profiles configured."
+    return "$failed"
+  fi
+
+  cmd_validate_one "$target"
+}
+
+cmd_list() {
+  local profiles active
+  profiles=$(_profile_names)
+  active=$(_active_profile || true)
 
   if [[ -z "$profiles" ]]; then
-    echo -e "${DIM}No profiles to warm.${RESET}"
+    echo -e "${DIM}No profiles configured. Run: cc-switch add <name>${RESET}"
     return
   fi
 
-  local swap_marker="$CLAUDE_HOME/.cc-swap-active"
-  local active=""
-  if [[ -f "$swap_marker" ]]; then
-    active=$(cat "$swap_marker" | tr -d '[:space:]')
-  fi
+  echo -e "${BOLD}Configured accounts:${RESET}"
+  echo ""
+  printf '%s\n' "$CC_SWITCH_DEFAULT_PROFILE" "$profiles" | awk 'NF && !seen[$0]++' | while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    local marker config_dir mode detail token_note
+    marker=" "
+    [[ "$name" == "$active" ]] && marker="*"
+    config_dir=$(_profile_config_dir "$name")
+    mode=$(_profile_auth_mode "$name")
 
-  # Sync default keychain credentials back to active profile
-  if [[ -n "$active" ]]; then
-    local active_dir="$HOME/.claude-$active"
-    if [[ -d "$active_dir" ]]; then
-      local default_creds
-      default_creds=$(_keychain_read "$CLAUDE_HOME") || true
-      if [[ -n "$default_creds" ]]; then
-        _keychain_write "$active_dir" "$default_creds"
-      fi
-      if [[ -f "$CLAUDE_HOME/.credentials.json" ]]; then
-        cp "$CLAUDE_HOME/.credentials.json" "$active_dir/.credentials.json"
-      fi
-      _warm_log "[${active}] Synced credentials from .claude"
+    if [[ "$mode" == "token" ]]; then
+      detail="${YELLOW}token auth${RESET} ${DIM}(API billing, no subscription)${RESET}"
+    elif [[ ! -d "$config_dir" ]]; then
+      detail="${RED}no config dir${RESET} ${DIM}${config_dir}${RESET}"
+    else
+      detail=$(_login_summary "$config_dir")
     fi
+
+    token_note=""
+    if [[ "$mode" != "token" ]] && _token_exists "$name"; then
+      token_note=" ${DIM}+headless token${RESET}"
+    fi
+
+    echo -e " ${marker} ${BOLD}${name}${RESET}  ${detail}${token_note}"
+    echo -e "     ${DIM}${config_dir}${RESET}"
+  done
+  echo ""
+  echo -e "${DIM}* = active profile used by plain 'claude'${RESET}"
+}
+
+cmd_shell_setup() {
+  _ensure_switch_home
+  touch "$SHELL_RC"
+
+  local profiles switch_bin
+  switch_bin=$(_shell_path "$(_switch_bin)")
+  profiles=$(_profile_names)
+  if [[ -n "$profiles" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      _install_profile_alias "$name"
+    done <<< "$profiles"
   fi
 
-  local claude_bin
-  claude_bin=$(_find_claude) || {
-    echo -e "${RED}Error:${RESET} claude binary not found"
-    _warm_log "ERROR: claude binary not found"
-    return 1
-  }
+  sed -i '' "/# cc-switch: ${CC_SWITCH_SHELL_WRAPPER_MARKER}$/d" "$SHELL_RC"
+  printf "claude() { %s run-active \"\$@\"; } # cc-switch: %s\n" "$switch_bin" "$CC_SWITCH_SHELL_WRAPPER_MARKER" >> "$SHELL_RC"
 
-  local warmed=0 skipped=0 failed=0
+  echo -e "${GREEN}Shell setup updated.${RESET}"
+  echo -e "  ${DIM}File: ${SHELL_RC}${RESET}"
+  echo ""
+  echo -e "Run: ${BOLD}source $SHELL_RC${RESET}"
+  echo -e "Plain ${BOLD}claude${RESET} will use the active profile from ${BOLD}${switch_bin} use <name>${RESET}."
+  echo -e "${DIM}Profiles select CLAUDE_CONFIG_DIR, so each keeps its own login and subscription.${RESET}"
+}
+
+cmd_claude_bin() {
+  if [[ $# -gt 0 ]]; then
+    _set_configured_claude_bin "$1"
+    echo -e "${GREEN}Claude binary set:${RESET} $1"
+    return
+  fi
+
+  _find_claude || die "Claude binary not found. Set it with: cc-switch claude-bin /path/to/claude"
+}
+
+cmd_sync() {
+  local profiles config_dir name count=0
+  profiles=$(_profile_names)
+  if [[ -z "$profiles" ]]; then
+    note "No profiles configured."
+    return 0
+  fi
 
   while IFS= read -r name; do
-    local profile_dir="$HOME/.claude-$name"
-
-    # Skip the active profile — tokens refresh through normal use
-    if [[ "$name" == "$active" ]]; then
-      ((skipped++))
-      continue
-    fi
-
-    if ! _keychain_exists "$profile_dir"; then
-      _warm_log "[${name}] No credentials — skipping"
-      ((skipped++))
-      continue
-    fi
-
-    if ! _token_needs_warm "$profile_dir"; then
-      _warm_log "[${name}] Token still fresh — skipping"
-      ((skipped++))
-      continue
-    fi
-
-    _warm_log "[${name}] Warming token..."
-    if _run_with_timeout 120 env CLAUDE_CONFIG_DIR="$profile_dir" "$claude_bin" -p "hi" --max-turns 1 >/dev/null 2>&1; then
-      _warm_log "[${name}] Token warmed"
-      echo -e "  ${BOLD}$name${RESET}  ${GREEN}warmed${RESET}"
-      ((warmed++))
-    else
-      _warm_log "[${name}] Warm failed"
-      echo -e "  ${BOLD}$name${RESET}  ${RED}failed${RESET}"
-      ((failed++))
-    fi
+    [[ -n "$name" ]] || continue
+    [[ "$name" == "$CC_SWITCH_DEFAULT_PROFILE" ]] && continue
+    config_dir=$(_profile_config_dir "$name")
+    [[ -d "$config_dir" ]] || continue
+    _link_shared_config "$config_dir"
+    echo -e "  ${GREEN}linked${RESET} ${BOLD}${name}${RESET} ${DIM}${config_dir}${RESET}"
+    count=$((count + 1))
   done <<< "$profiles"
 
   echo ""
-  echo -e "${DIM}${warmed} warmed, ${skipped} skipped, ${failed} failed${RESET}"
-  echo -e "${DIM}Log: ${WARM_LOG_FILE}${RESET}"
+  echo -e "${GREEN}Re-linked shared config into ${count} profile(s).${RESET}"
 }
 
+cmd_warm() {
+  note "setup-token profiles do not use the old token warmer. Running validation instead."
+  cmd_validate --all
+}
+
+WARM_PLIST_NAME="com.cc-switch.warm"
+WARM_PLIST_DST="${HOME}/Library/LaunchAgents/${WARM_PLIST_NAME}.plist"
+
 cmd_warm_setup() {
-  local script_path
-  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-
-  cat > "$WARM_PLIST_DST" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${WARM_PLIST_NAME}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${script_path}</string>
-        <string>warm</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>1800</integer>
-    <key>StandardOutPath</key>
-    <string>${HOME}/.cc-switch/launchd-stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>${HOME}/.cc-switch/launchd-stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
-        <key>HOME</key>
-        <string>${HOME}</string>
-    </dict>
-</dict>
-</plist>
-PLIST
-
-  mkdir -p "${HOME}/.cc-switch"
-  launchctl unload "$WARM_PLIST_DST" 2>/dev/null || true
-  launchctl load "$WARM_PLIST_DST"
-
-  echo -e "${GREEN}Token warming installed.${RESET} Runs every 30 minutes."
-  echo -e "  Plist: ${WARM_PLIST_DST}"
-  echo -e "  Log:   ${WARM_LOG_FILE}"
-  echo ""
-  echo -e "To stop: ${BOLD}cc-switch warm-uninstall${RESET}"
+  die "The old warming job is disabled for setup-token profiles. Use: cc-switch validate --all"
 }
 
 cmd_warm_uninstall() {
   if [[ -f "$WARM_PLIST_DST" ]]; then
     launchctl unload "$WARM_PLIST_DST" 2>/dev/null || true
     rm -f "$WARM_PLIST_DST"
-    echo -e "${GREEN}Token warming uninstalled.${RESET}"
+    echo -e "${GREEN}Removed old token warming job.${RESET}"
   else
-    echo -e "${DIM}Token warming not installed.${RESET}"
+    note "Old token warming job is not installed."
+  fi
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  validate_name "$name"
+
+  _token_delete "$name"
+  rm -rf "$(_profile_dir "$name")"
+  _remove_profile_alias "$name"
+
+  if [[ "$(_active_profile || true)" == "$name" ]]; then
+    rm -f "$CC_SWITCH_ACTIVE_FILE" "$CC_SWITCH_LEGACY_ACTIVE_FILE"
+  fi
+
+  echo -e "${GREEN}Removed profile ${BOLD}$name${RESET}.${RESET}"
+  if [[ -d "${HOME}/.claude-${name}" ]]; then
+    echo -e "${DIM}Left legacy directory in place: ~/.claude-${name}${RESET}"
+  fi
+  echo -e "Run: ${BOLD}source $SHELL_RC${RESET}"
+}
+
+cmd_uninstall() {
+  echo -e "${BOLD}Removing cc-auth-switcher profiles...${RESET}"
+
+  local profiles
+  profiles=$(_profile_names)
+  if [[ -n "$profiles" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      _token_delete "$name"
+      echo -e "  ${RED}-${RESET} token/profile ${name}"
+    done <<< "$profiles"
+  fi
+
+  rm -rf "$CC_SWITCH_PROFILES_DIR" "$CC_SWITCH_TOKENS_DIR"
+  rm -f "$CC_SWITCH_ACTIVE_FILE" "$CC_SWITCH_CONFIG_FILE"
+  [[ -f "$CC_SWITCH_LEGACY_ACTIVE_FILE" ]] && rm -f "$CC_SWITCH_LEGACY_ACTIVE_FILE"
+
+  if [[ -f "$SHELL_RC" ]]; then
+    sed -i '' '/# cc-switch: /d' "$SHELL_RC"
+    echo -e "  ${RED}-${RESET} Removed aliases/functions from $(basename "$SHELL_RC")"
+  fi
+
+  echo ""
+  echo -e "${GREEN}Done.${RESET} Run: source $SHELL_RC"
+}
+
+cmd_doctor() {
+  local claude_bin active profiles launchd
+  claude_bin=$(_find_claude || true)
+  active=$(_active_profile || true)
+  profiles=$(_profile_names)
+
+  echo -e "${BOLD}cc-switch doctor${RESET}"
+  echo ""
+  echo "Home:            $CC_SWITCH_HOME"
+  echo "Active profile:  ${active:-none (plain claude uses ${CLAUDE_HOME})}"
+  echo "Shell rc:        $SHELL_RC"
+  echo "Claude binary:   ${claude_bin:-not found}"
+  echo "Default login:   $(_login_summary "$CLAUDE_HOME")"
+  echo -e "Token backend:   $(_token_backend) ${DIM}(headless only)${RESET}"
+
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo ""
+    echo -e "${YELLOW}Warning:${RESET} CLAUDE_CODE_OAUTH_TOKEN is set in this shell."
+    echo -e "${DIM}It overrides profile logins and forces API billing. Unset it for interactive use.${RESET}"
+  fi
+
+  local wrapper_line
+  wrapper_line=$(grep -c "# cc-switch: ${CC_SWITCH_SHELL_WRAPPER_MARKER}\$" "$SHELL_RC" 2>/dev/null || true)
+  echo "Plain claude:    $([[ "${wrapper_line:-0}" -gt 0 ]] && echo "wrapped -> active profile" || echo "not wrapped (real binary)")"
+
+  echo ""
+  if [[ -n "$profiles" ]]; then
+    cmd_list
+  else
+    note "No profiles configured."
+  fi
+
+  launchd=$(launchctl list 2>/dev/null | awk '/cc-rate-balancer|cc-switch/ {print $3}' || true)
+  if [[ -n "$launchd" ]]; then
+    echo -e "${YELLOW}Launchd jobs still loaded:${RESET}"
+    echo "$launchd"
   fi
 }
 
 case "${1:-}" in
-  add)             cmd_add "${2:-}" ;;
-  remove)          cmd_remove "${2:-}" ;;
+  add)             shift; cmd_add "$@" ;;
+  login)           shift; cmd_login "$@" ;;
+  logout)          shift; cmd_logout "$@" ;;
+  token)           shift; cmd_token "$@" ;;
+  run)             shift; cmd_run "$@" ;;
+  run-active)      shift; cmd_run_active "$@" ;;
+  use)             shift; cmd_use "$@" ;;
   swap)            shift; cmd_swap "$@" ;;
+  validate)        shift; cmd_validate "$@" ;;
   list)            cmd_list ;;
+  shell-setup)     cmd_shell_setup ;;
+  claude-bin)      shift; cmd_claude_bin "$@" ;;
+  doctor)          cmd_doctor ;;
   sync)            cmd_sync ;;
   warm)            cmd_warm ;;
   warm-setup)      cmd_warm_setup ;;
   warm-uninstall)  cmd_warm_uninstall ;;
+  remove)          shift; cmd_remove "$@" ;;
   uninstall)       cmd_uninstall ;;
   -h|--help)       usage ;;
   *)               usage ;;
